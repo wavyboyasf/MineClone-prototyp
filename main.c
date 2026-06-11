@@ -32,6 +32,21 @@
 #include <string.h>
 #include <stdarg.h>
 
+/* Zgodnosc: funkcje obecne w MSVC, ale nie w standardzie C/POSIX (Linux/macOS). */
+#ifndef _WIN32
+  #include <strings.h>                 /* strcasecmp */
+  #define _stricmp strcasecmp
+  #define strtok_s  strtok_r           /* identyczna sygnatura jak w MSVC */
+  /* strcat_s(dst, cap, src) - bezpieczne dolaczenie z limitem rozmiaru bufora */
+  static void strcat_s(char *dst, size_t cap, const char *src) {
+      size_t dl = strlen(dst);
+      if (dl + 1 >= cap) return;
+      size_t i = 0;
+      while (src[i] && dl + i + 1 < cap) { dst[dl + i] = src[i]; i++; }
+      dst[dl + i] = '\0';
+  }
+#endif
+
 #define WX 192             /* szerokosc swiata (X) */
 #define WY 48              /* wysokosc swiata (Y) */
 #define WZ 192             /* glebokosc swiata (Z) */

@@ -1,21 +1,62 @@
 /*
  * net.c - prosta warstwa sieciowa TCP (LAN) dla MineClone.
  * Nieblokujace gniazda + ramki [u32 dlugosc][dane].
+ *
+ * Wieloplatformowo: na Windows uzywa Winsock2, na Linux/macOS gniazd POSIX.
+ * Roznice API ukrywa cienka warstwa zgodnosci ponizej, dzieki czemu
+ * wlasciwa logika (pumpConn, ramki, kolejki) jest wspolna dla obu systemow.
  */
 #include "net.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
-#pragma comment(lib, "ws2_32.lib")
+/* ---------------------------------------------------------------------- */
+/* Warstwa zgodnosci: Winsock (Windows) vs gniazda POSIX (Linux/macOS).    */
+/* ---------------------------------------------------------------------- */
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+
+  typedef SOCKET sock_t;
+  #define NET_INVALID_SOCK   INVALID_SOCKET
+  #define netCloseSock(s)    closesocket(s)
+  #define netLastErr()       WSAGetLastError()
+  #define netSleepMs(ms)     Sleep(ms)
+  static int  netWouldBlock(int e) { return e == WSAEWOULDBLOCK; }
+#else
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  #include <sys/select.h>
+  #include <netinet/in.h>
+  #include <netinet/tcp.h>
+  #include <arpa/inet.h>
+  #include <netdb.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <errno.h>
+  #include <time.h>
+  #include <ifaddrs.h>
+
+  typedef int sock_t;
+  #define NET_INVALID_SOCK   (-1)
+  #define INVALID_SOCKET     (-1)
+  #define SOCKET_ERROR       (-1)
+  #define netCloseSock(s)    close(s)
+  #define netLastErr()       (errno)
+  static void netSleepMs(int ms) {
+      struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+      nanosleep(&ts, NULL);
+  }
+  static int netWouldBlock(int e) { return e == EWOULDBLOCK || e == EAGAIN; }
+#endif
 
 #define NET_BUFCAP (2u * 1024u * 1024u + 4096u)   /* miesci pelny swiat */
 
 typedef struct {
-    SOCKET s;
+    sock_t s;
     int active;
     unsigned char *buf;
     unsigned int len;
@@ -23,27 +64,34 @@ typedef struct {
 
 static int gRole = NET_OFF;
 static int gWsaUp = 0;
-static SOCKET gListen = INVALID_SOCKET;
+static sock_t gListen = NET_INVALID_SOCK;
 static Conn gConns[NET_MAX_CLIENTS + 1];   /* [0] = polaczenie klienta z hostem */
 static int gJoinQ[16], gJoinN = 0;
 static int gLeftQ[16], gLeftN = 0;
 
 static void wsaUp(void) {
     if (!gWsaUp) {
+#ifdef _WIN32
         WSADATA w;
         WSAStartup(MAKEWORD(2, 2), &w);
+#endif
         gWsaUp = 1;
     }
 }
 
-static void setNonBlocking(SOCKET s) {
+static void setNonBlocking(sock_t s) {
+#ifdef _WIN32
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl != -1) fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 }
 
-static void connOpen(Conn *c, SOCKET s) {
+static void connOpen(Conn *c, sock_t s) {
     c->s = s;
     c->active = 1;
     c->len = 0;
@@ -52,7 +100,7 @@ static void connOpen(Conn *c, SOCKET s) {
 
 static void connClose(Conn *c) {
     if (c->active) {
-        closesocket(c->s);
+        netCloseSock(c->s);
         c->active = 0;
         c->len = 0;
     }
@@ -64,18 +112,18 @@ int netStartHost(int port) {
     wsaUp();
     netStop();
     gListen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (gListen == INVALID_SOCKET) return -1;
+    if (gListen == NET_INVALID_SOCK) return -1;
     int one = 1;
     setsockopt(gListen, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = INADDR_ANY;
-    a.sin_port = htons((u_short)port);
+    a.sin_port = htons((unsigned short)port);
     if (bind(gListen, (struct sockaddr *)&a, sizeof(a)) != 0 ||
         listen(gListen, 4) != 0) {
-        closesocket(gListen);
-        gListen = INVALID_SOCKET;
+        netCloseSock(gListen);
+        gListen = NET_INVALID_SOCK;
         return -1;
     }
     setNonBlocking(gListen);
@@ -86,14 +134,14 @@ int netStartHost(int port) {
 int netConnect(const char *ip, int port) {
     wsaUp();
     netStop();
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return -1;
+    sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == NET_INVALID_SOCK) return -1;
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
-    a.sin_port = htons((u_short)port);
+    a.sin_port = htons((unsigned short)port);
     if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
-        closesocket(s);
+        netCloseSock(s);
         return -1;
     }
     /* blokujace connect z krotkim timeoutem przez gniazdo nieblokujace */
@@ -103,9 +151,13 @@ int netConnect(const char *ip, int port) {
     FD_ZERO(&wr); FD_ZERO(&ex);
     FD_SET(s, &wr); FD_SET(s, &ex);
     struct timeval tv = { 3, 0 };   /* 3 s */
+#ifdef _WIN32
     int r = select(0, NULL, &wr, &ex, &tv);
+#else
+    int r = select((int)s + 1, NULL, &wr, &ex, &tv);
+#endif
     if (r <= 0 || FD_ISSET(s, &ex)) {
-        closesocket(s);
+        netCloseSock(s);
         return -1;
     }
     connOpen(&gConns[0], s);
@@ -115,9 +167,9 @@ int netConnect(const char *ip, int port) {
 
 void netStop(void) {
     for (int i = 0; i <= NET_MAX_CLIENTS; i++) connClose(&gConns[i]);
-    if (gListen != INVALID_SOCKET) {
-        closesocket(gListen);
-        gListen = INVALID_SOCKET;
+    if (gListen != NET_INVALID_SOCK) {
+        netCloseSock(gListen);
+        gListen = NET_INVALID_SOCK;
     }
     gRole = NET_OFF;
     gJoinN = gLeftN = 0;
@@ -137,8 +189,8 @@ static void pumpConn(Conn *c, int id) {
             if (gLeftN < 16) gLeftQ[gLeftN++] = id;
             return;
         }
-        int e = WSAGetLastError();
-        if (e == WSAEWOULDBLOCK) break;
+        int e = netLastErr();
+        if (netWouldBlock(e)) break;
         connClose(c);                       /* blad = rozlaczenie */
         if (gLeftN < 16) gLeftQ[gLeftN++] = id;
         return;
@@ -148,12 +200,12 @@ static void pumpConn(Conn *c, int id) {
 void netPump(void) {
     if (gRole == NET_HOST) {
         for (;;) {
-            SOCKET s = accept(gListen, NULL, NULL);
-            if (s == INVALID_SOCKET) break;
+            sock_t s = accept(gListen, NULL, NULL);
+            if (s == NET_INVALID_SOCK) break;
             int slot = -1;
             for (int i = 1; i <= NET_MAX_CLIENTS; i++)
                 if (!gConns[i].active) { slot = i; break; }
-            if (slot < 0) { closesocket(s); continue; }
+            if (slot < 0) { netCloseSock(s); continue; }
             setNonBlocking(s);
             connOpen(&gConns[slot], s);
             if (gJoinN < 16) gJoinQ[gJoinN++] = slot;
@@ -218,10 +270,10 @@ static void sendAll(Conn *c, const void *data, int len) {
     int left = len;
     int guard = 0;
     while (left > 0) {
-        int n = send(c->s, p, left, 0);
+        int n = (int)send(c->s, p, left, 0);
         if (n > 0) { p += n; left -= n; guard = 0; continue; }
-        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
-            Sleep(1);
+        if (n == SOCKET_ERROR && netWouldBlock(netLastErr())) {
+            netSleepMs(1);
             if (++guard > 5000) { connClose(c); return; }   /* ~5 s */
             continue;
         }
@@ -256,9 +308,17 @@ void netBroadcastExcept(int exceptId, const void *data, int len) {
     }
 }
 
+static void netCopyStr(char *out, int outCap, const char *src) {
+    if (outCap <= 0) return;
+    int i = 0;
+    for (; src[i] && i < outCap - 1; i++) out[i] = src[i];
+    out[i] = '\0';
+}
+
 void netLocalIp(char *out, int outCap) {
     wsaUp();
-    strncpy_s(out, (size_t)outCap, "127.0.0.1", _TRUNCATE);
+    netCopyStr(out, outCap, "127.0.0.1");
+#ifdef _WIN32
     char host[256];
     if (gethostname(host, sizeof(host)) != 0) return;
     struct addrinfo hints, *res = NULL;
@@ -271,10 +331,27 @@ void netLocalIp(char *out, int outCap) {
         char tmp[64];
         if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) {
             if (strncmp(tmp, "127.", 4) != 0) {
-                strncpy_s(out, (size_t)outCap, tmp, _TRUNCATE);
+                netCopyStr(out, outCap, tmp);
                 break;
             }
         }
     }
     freeaddrinfo(res);
+#else
+    /* POSIX: przejrzyj interfejsy i wybierz pierwszy adres IPv4 != loopback */
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0 || !ifa) return;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        struct sockaddr_in *sa = (struct sockaddr_in *)p->ifa_addr;
+        char tmp[64];
+        if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) {
+            if (strncmp(tmp, "127.", 4) != 0) {
+                netCopyStr(out, outCap, tmp);
+                break;
+            }
+        }
+    }
+    freeifaddrs(ifa);
+#endif
 }
