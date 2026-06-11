@@ -26,6 +26,8 @@
 #include "raylib.h"
 #include "rlgl.h"
 #include "net.h"
+#include "game.h"        /* wspolny rdzen: stale, bloki, API swiata */
+#include "entities.h"    /* postacie: gracz, NPC, Glazew, roboty, koty */
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -47,72 +49,52 @@
   }
 #endif
 
-#define WX 192             /* szerokosc swiata (X) */
-#define WY 48              /* wysokosc swiata (Y) */
-#define WZ 192             /* glebokosc swiata (Z) */
-#define GROUND 10          /* poziom gruntu kampusu */
-#define EYE_HEIGHT 1.62f
+/* Stale wspolne (WX/WY/WZ, GROUND, EYE_HEIGHT, MAX_PLAYERS), bloki B_*,
+   itemy IT_* i operacje OP_* sa w game.h. Ponizej tylko to, czego uzywa
+   wylacznie main.c. */
 #define PLAYER_HW  0.30f
 #define PLAYER_H   1.80f
 #define MAX_REACH  6.0f
 #define MAX_HP     20
 #define MAX_BREATH 10.0f
-#define MAX_PLAYERS 8      /* host + 7 klientow */
 #define MAX_NOTES 160
-
-enum { B_AIR = 0, B_GRASS, B_DIRT, B_STONE, B_SAND, B_WOOD, B_LEAVES, B_WATER,
-       B_BRICK, B_PLASTER, B_ROOF, B_WINDOW, B_PAVING, B_TABLE, B_CHAIR, B_NOTEBOOK };
-
-/* itemy: < 100 to bloki, >= 100 to narzedzia */
-enum { IT_PICKAXE = 100, IT_AXE, IT_SHOVEL, IT_SWORD };
 
 /* wiadomosci sieciowe */
 enum { M_HELLO = 1, M_WELCOME, M_WORLD, M_POS, M_BLOCK, M_CHAT, M_NICK,
        M_NOTE, M_GLZ, M_GHIT, M_APPLY, M_LEAVE, M_CMD };
-/* operacje M_APPLY */
-enum { OP_TP = 1, OP_HEAL, OP_KILL, OP_FLY, OP_DMG };
 
-static unsigned char world[WX][WY][WZ];
+unsigned char world[WX][WY][WZ];        /* deklaracja extern w game.h */
 static int heightMap[WX][WZ];
 static unsigned int gSeed = 1337u;
 
-/* ---- stan lokalnego gracza (globalny, zeby komendy/siec mialy dostep) ---- */
-static Vector3 gPos, gVel, gSpawn;
+/* poziom wody na komorke: 0=brak, WATER_SRC(8)=zrodlo, 1..7=plynaca (7 najwyzsza).
+   world[x][y][z]==B_WATER  <=>  gWater[x][y][z] > 0 */
+#define WATER_SRC 8
+static unsigned char gWater[WX][WY][WZ];
+
+/* ---- stan lokalnego gracza (globalny, zeby komendy/siec mialy dostep) ----
+   gPos/gNow/gMyId/gDead sa nie-static, bo uzywa ich modul postaci (game.h). */
+Vector3 gPos;
+static Vector3 gVel, gSpawn;
 static float gYaw, gPitch;
 static int gFly = 0, gOnGround = 0, gSitting = 0;
 static int gHotbar[9] = { IT_SWORD, IT_PICKAXE, IT_AXE, IT_SHOVEL,
                           B_STONE, B_WOOD, B_PLASTER, B_WINDOW, B_PAVING };
 static int gSel = 0;
 static char gNick[24] = "Gracz";
-static int gMyId = 0;
-static int gHp = MAX_HP, gDead = 0;
-static float gHurt = 0.0f, gBreath = MAX_BREATH, gLastDmg = -100.0f, gNow = 0.0f;
+int gMyId = 0;
+static int gHp = MAX_HP;
+int gDead = 0;
+static float gHurt = 0.0f, gBreath = MAX_BREATH, gLastDmg = -100.0f;
+float gNow = 0.0f;
 static int gNeedRebuild = 0;
 
-/* ---- pozostali gracze ---- */
-typedef struct {
-    int active;
-    char nick[24];
-    Vector3 pos, disp, prevDisp;
-    float yaw, pitch, swingAmp;
-} Peer;
-static Peer gPeers[MAX_PLAYERS];
+/* ---- pozostali gracze (typ Peer w game.h) ---- */
+Peer gPeers[MAX_PLAYERS];
 
 /* ---- zeszyty ---- */
 typedef struct { int used, x, y, z; char text[240]; } Note;
 static Note gNotes[MAX_NOTES];
-
-/* ---- roboty (deterministyczne patrole - bez synchronizacji) ---- */
-typedef struct { float cx, cz, rx, rz, sp, ph; } Robot;
-static Robot gRobots[6];
-static int gRobotN = 0;
-
-/* ---- Glazew ---- */
-static struct {
-    Vector3 pos, vel, home;
-    float yaw, stateT, hitCool, flashT, animT;
-    int hp, active, state;   /* 0 czeka, 1 zauwazyl, 2 goni, 3 wraca */
-} gGlz;
 
 /* ---- czat / komunikaty ---- */
 static char gChatLog[8][160];
@@ -132,7 +114,7 @@ static void chatPush(const char *fmt, ...) {
     gChatT[0] = gNow;
 }
 
-static void toast(const char *fmt, ...) {
+void toast(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(gToast, sizeof(gToast), fmt, ap);
@@ -145,11 +127,11 @@ static void toast(const char *fmt, ...) {
 static int inBounds(int x, int y, int z) {
     return x >= 0 && x < WX && y >= 0 && y < WY && z >= 0 && z < WZ;
 }
-static unsigned char getBlock(int x, int y, int z) {
+unsigned char getBlock(int x, int y, int z) {
     return inBounds(x, y, z) ? world[x][y][z] : B_AIR;
 }
 /* kolizje fizyczne */
-static int isSolid(unsigned char b) {
+int isSolid(unsigned char b) {
     return b != B_AIR && b != B_WATER && b != B_NOTEBOOK;
 }
 /* pelne, nieprzezroczyste szesciany (do chowania scian sasiadow) */
@@ -488,14 +470,8 @@ static void buildLab(void) {
         world[x][GROUND + 1][Z1 - 1] = B_TABLE;
     }
 
-    /* roboty: deterministyczne patrole (eliptyczne) */
-    gRobotN = 0;
-    gRobots[gRobotN++] = (Robot){ 152.0f, 90.0f, 5.0f, 6.0f, 0.50f, 0.0f };
-    gRobots[gRobotN++] = (Robot){ 149.0f, 82.0f, 3.0f, 3.5f, 0.80f, 2.0f };
-    gRobots[gRobotN++] = (Robot){ 155.0f, 97.0f, 2.5f, 4.0f, 0.65f, 4.0f };
-    gRobots[gRobotN++] = (Robot){ 168.0f, 90.0f, 5.0f, 6.0f, 0.45f, 1.0f };
-    gRobots[gRobotN++] = (Robot){ 165.0f, 80.0f, 3.0f, 2.5f, 0.70f, 3.0f };
-    gRobots[gRobotN++] = (Robot){ 172.0f, 97.0f, 3.0f, 4.0f, 0.60f, 5.0f };
+    /* roboty: deterministyczne patrole (eliptyczne) - definicja w entities.c */
+    robotsInitDefault();
 }
 
 static void genWorld(void) {
@@ -614,6 +590,7 @@ static const char *itemName(int it) {
         case B_SAND:     return "Piasek";
         case B_WOOD:     return "Drewno";
         case B_LEAVES:   return "Liscie";
+        case B_WATER:    return "Woda (zrodlo)";
         case B_BRICK:    return "Cegla";
         case B_PLASTER:  return "Tynk";
         case B_ROOF:     return "Lupek (dach)";
@@ -643,7 +620,7 @@ static int toolFor(unsigned char b) {
 
 static const int ITEMS[] = {
     B_GRASS, B_DIRT, B_STONE, B_SAND, B_WOOD, B_LEAVES, B_BRICK, B_PLASTER,
-    B_ROOF, B_WINDOW, B_PAVING, B_TABLE, B_CHAIR, B_NOTEBOOK,
+    B_ROOF, B_WINDOW, B_PAVING, B_WATER, B_TABLE, B_CHAIR, B_NOTEBOOK,
     IT_PICKAXE, IT_AXE, IT_SHOVEL, IT_SWORD
 };
 #define ITEM_COUNT ((int)(sizeof(ITEMS) / sizeof(ITEMS[0])))
@@ -754,12 +731,17 @@ static void rebuildWorldModels(void) {
         if (b == B_AIR) continue;
 
         if (b == B_WATER) {
+            /* wysokosc tafli zalezy od poziomu: zrodlo/spadajaca = pelna,
+               plynaca tym nizsza, im mniejszy poziom (efekt skosu) */
+            unsigned char wl = gWater[x][y][z];
+            float topY = (wl >= WATER_SRC || getBlock(x, y + 1, z) == B_WATER)
+                         ? 0.88f : 0.12f + 0.095f * (float)wl;
             if (getBlock(x, y + 1, z) == B_AIR)
-                pushFace(&tr, x, y, z, 0, baseColor(B_WATER, 0), 0.88f);
+                pushFace(&tr, x, y, z, 0, baseColor(B_WATER, 0), topY);
             for (int f = 2; f < 6; f++)
                 if (getBlock(x + FACE_DIR[f][0], y, z + FACE_DIR[f][2]) == B_AIR)
                     pushFace(&tr, x, y, z, f,
-                             shadeColor(baseColor(B_WATER, f), FACE_SHADE[f]), 0.88f);
+                             shadeColor(baseColor(B_WATER, f), FACE_SHADE[f]), topY);
             continue;
         }
         if (b == B_WINDOW) {        /* transparentne szklo */
@@ -815,9 +797,120 @@ static void rebuildWorldModels(void) {
     else { free(tr.verts); free(tr.cols); }
 }
 
+/* ---------------- woda: rozlewanie (model komorkowy a la Minecraft) ----------------
+   Woda plynie w dol i rozlewa sie na boki, tracac po 1 poziomie na kratke
+   (zrodlo=8, wiec rozlewa sie do ~7 kratek). Aktywne komorki trzymamy w
+   kolejce cyklicznej z flaga "w kolejce", a stan przeliczamy z sasiadow
+   (model "pull": komorka bierze max poziom z sasiadow - 1; nad woda = 7).
+   Symulacja jest lokalna i deterministyczna - edycje blokow sa juz
+   synchronizowane po sieci, wiec u kazdego gracza woda rozlewa sie tak samo. */
+
+#define WATERQ_CAP (1 << 16)
+static int gWQ[WATERQ_CAP];
+static int gWQHead = 0, gWQTail = 0;
+static unsigned char gWInQ[WX * WY * WZ];   /* czy komorka jest juz w kolejce */
+static float gWaterAcc = 0.0f;
+
+static int wpack(int x, int y, int z) { return (x * WY + y) * WZ + z; }
+
+static void wEnqueue(int x, int y, int z) {
+    if (!inBounds(x, y, z)) return;
+    int id = wpack(x, y, z);
+    if (gWInQ[id]) return;
+    int nt = (gWQTail + 1) & (WATERQ_CAP - 1);
+    if (nt == gWQHead) return;          /* kolejka pelna - pomijamy (rzadkie) */
+    gWInQ[id] = 1;
+    gWQ[gWQTail] = id;
+    gWQTail = nt;
+}
+
+static void wEnqueueNeighbors(int x, int y, int z) {
+    wEnqueue(x + 1, y, z); wEnqueue(x - 1, y, z);
+    wEnqueue(x, y + 1, z); wEnqueue(x, y - 1, z);
+    wEnqueue(x, y, z + 1); wEnqueue(x, y, z - 1);
+}
+
+/* Wywolac po KAZDEJ zmianie bloku (lokalnej lub sieciowej). Ustawia poziom
+   wody komorki (postawiona woda = zrodlo) i budzi sasiadow. */
+static void waterOnEdit(int x, int y, int z) {
+    if (!inBounds(x, y, z)) return;
+    if (world[x][y][z] == B_WATER) {
+        if (gWater[x][y][z] == 0) gWater[x][y][z] = WATER_SRC;   /* nowo postawiona = zrodlo */
+    } else {
+        gWater[x][y][z] = 0;
+    }
+    wEnqueue(x, y, z);
+    wEnqueueNeighbors(x, y, z);
+}
+
+/* Odbudowa poziomow wody ze stanu swiata: kazda woda = zrodlo. Uzywane na
+   starcie (po genWorld) i po wczytaniu swiata z sieci (M_WORLD). */
+static void waterInit(void) {
+    gWQHead = gWQTail = 0;
+    memset(gWInQ, 0, sizeof(gWInQ));
+    for (int x = 0; x < WX; x++)
+    for (int y = 0; y < WY; y++)
+    for (int z = 0; z < WZ; z++)
+        gWater[x][y][z] = (world[x][y][z] == B_WATER) ? WATER_SRC : 0;
+    /* obudz komorki sasiadujace ze zrodlami, zeby ewentualnie poplynely */
+    for (int x = 0; x < WX; x++)
+    for (int y = 0; y < WY; y++)
+    for (int z = 0; z < WZ; z++)
+        if (gWater[x][y][z] > 0) wEnqueueNeighbors(x, y, z);
+}
+
+static unsigned char wlvl(int x, int y, int z) {
+    return inBounds(x, y, z) ? gWater[x][y][z] : 0;
+}
+
+static void waterTick(void) {
+    int changed = 0;
+    int budget = 8192;                  /* limit komorek na tik (plynnosc) */
+    while (budget-- > 0 && gWQHead != gWQTail) {
+        int id = gWQ[gWQHead];
+        gWQHead = (gWQHead + 1) & (WATERQ_CAP - 1);
+        gWInQ[id] = 0;
+        int x = id / (WY * WZ), r = id % (WY * WZ), y = r / WZ, z = r % WZ;
+
+        unsigned char b = world[x][y][z];
+        unsigned char lvl = gWater[x][y][z];
+
+        if (lvl == WATER_SRC) continue;             /* zrodlo trwa bez zmian */
+        if (isSolid(b)) continue;                   /* staly blok - woda nie wejdzie */
+
+        /* docelowy poziom z sasiadow: cos nad nami = pelne 7 (woda spada),
+           a po bokach max-1. Kluczowa regula jak w Minecraft: sasiad rozlewa
+           sie w bok TYLKO gdy nie moze spasc (pod nim blok staly lub woda) -
+           dzieki temu wodospad jest waski i rozlewa sie dopiero na dnie. */
+        unsigned char target = 0;
+        if (getBlock(x, y + 1, z) == B_WATER) target = 7;
+        static const int H[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+        for (int k = 0; k < 4; k++) {
+            int nx = x + H[k][0], nz = z + H[k][1];
+            unsigned char nl = wlvl(nx, y, nz);
+            if (nl == 0) continue;
+            /* sasiad rozlewa sie w bok tylko gdy NIE moze spasc: stoi na bloku
+               stalym albo na zrodle. Jesli pod nim powietrze lub plynaca woda,
+               to woda tamtedy spada w dol (waski wodospad), nie rozlewa sie. */
+            if (!isSolid(getBlock(nx, y - 1, nz)) && wlvl(nx, y - 1, nz) < WATER_SRC) continue;
+            unsigned char eff = (nl >= WATER_SRC) ? 8 : nl;
+            if ((unsigned char)(eff - 1) > target) target = (unsigned char)(eff - 1);
+        }
+        if (target > 7) target = 7;
+
+        if (target != lvl) {
+            gWater[x][y][z] = target;
+            world[x][y][z] = (target > 0) ? B_WATER : B_AIR;
+            wEnqueueNeighbors(x, y, z);             /* zmiana - przelicz sasiadow */
+            changed = 1;
+        }
+    }
+    if (changed) gNeedRebuild = 1;
+}
+
 /* ---------------- fizyka / kolizje ---------------- */
 
-static int boxCollidesHW(Vector3 feet, float hw, float h) {
+int boxCollidesHW(Vector3 feet, float hw, float h) {
     int x0 = (int)floorf(feet.x - hw), x1 = (int)floorf(feet.x + hw);
     int y0 = (int)floorf(feet.y),      y1 = (int)floorf(feet.y + h - 0.001f);
     int z0 = (int)floorf(feet.z - hw), z1 = (int)floorf(feet.z + hw);
@@ -854,7 +947,7 @@ static int raycast(Vector3 ro, Vector3 rd, float maxDist, int hit[3], int prev[3
 }
 
 /* czy z punktu a widac punkt b (brak pelnych blokow po drodze) */
-static int lineOfSight(Vector3 a, Vector3 b) {
+int lineOfSight(Vector3 a, Vector3 b) {
     Vector3 d = { b.x - a.x, b.y - a.y, b.z - a.z };
     float len = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
     if (len < 0.01f) return 1;
@@ -1064,234 +1157,6 @@ static void updateJp2Music(void) {
     }
 }
 
-/* ---------------- model gracza (lysy czlowiek) ---------------- */
-
-static void drawPlayerModel(Vector3 feet, float yaw, float pitch, float swing, Color shirt) {
-    Color skin  = { 236, 188, 150, 255 };
-    Color skin2 = { 214, 165, 130, 255 };
-    Color pants = {  64,  66,  82, 255 };
-    Color shoe  = {  45,  45,  50, 255 };
-    Color pupil = {  60,  60, 120, 255 };
-    Color mouth = { 150, 100,  90, 255 };
-
-    rlPushMatrix();
-    rlTranslatef(feet.x, feet.y, feet.z);
-    rlRotatef(90.0f - yaw * RAD2DEG, 0.0f, 1.0f, 0.0f);
-
-    DrawCube((Vector3){ 0.0f, 1.125f, 0.0f }, 0.50f, 0.75f, 0.25f, shirt);
-
-    rlPushMatrix();
-    rlTranslatef(0.0f, 1.50f, 0.0f);
-    rlRotatef(-pitch * RAD2DEG, 1.0f, 0.0f, 0.0f);
-    DrawCube((Vector3){ 0.0f, 0.25f, 0.0f }, 0.50f, 0.50f, 0.50f, skin);
-    DrawCube((Vector3){ -0.10f, 0.30f, 0.252f }, 0.10f, 0.07f, 0.02f, WHITE);
-    DrawCube((Vector3){  0.10f, 0.30f, 0.252f }, 0.10f, 0.07f, 0.02f, WHITE);
-    DrawCube((Vector3){ -0.08f, 0.30f, 0.262f }, 0.05f, 0.07f, 0.02f, pupil);
-    DrawCube((Vector3){  0.12f, 0.30f, 0.262f }, 0.05f, 0.07f, 0.02f, pupil);
-    DrawCube((Vector3){  0.00f, 0.20f, 0.258f }, 0.08f, 0.08f, 0.03f, skin2);
-    DrawCube((Vector3){  0.00f, 0.10f, 0.252f }, 0.16f, 0.04f, 0.02f, mouth);
-    rlPopMatrix();
-
-    for (int s = -1; s <= 1; s += 2) {
-        rlPushMatrix();
-        rlTranslatef(s * 0.375f, 1.42f, 0.0f);
-        rlRotatef(s * swing, 1.0f, 0.0f, 0.0f);
-        DrawCube((Vector3){ 0.0f, -0.28f, 0.0f }, 0.24f, 0.68f, 0.24f, skin);
-        DrawCube((Vector3){ 0.0f, -0.05f, 0.0f }, 0.27f, 0.26f, 0.27f, shirt);
-        rlPopMatrix();
-
-        rlPushMatrix();
-        rlTranslatef(s * 0.125f, 0.78f, 0.0f);
-        rlRotatef(-s * swing, 1.0f, 0.0f, 0.0f);
-        DrawCube((Vector3){ 0.0f, -0.39f, 0.0f }, 0.24f, 0.78f, 0.24f, pants);
-        DrawCube((Vector3){ 0.0f, -0.70f, 0.01f }, 0.26f, 0.16f, 0.28f, shoe);
-        rlPopMatrix();
-    }
-    rlPopMatrix();
-}
-
-/* ---------------- NPC: Jan Pawel II ---------------- */
-
-static const Vector3 NPC_POS = { 101.5f, (float)(GROUND + 1), 87.5f };
-#define NPC_YAW (-PI / 2.0f)
-
-static void drawNPC(float headYawDeg, float headPitchDeg, float waveDeg) {
-    Color robe  = { 250, 250, 247, 255 };
-    Color cape  = { 233, 233, 228, 255 };
-    Color capC  = { 255, 253, 244, 255 };
-    Color skin  = { 240, 204, 173, 255 };
-    Color skin2 = { 220, 176, 146, 255 };
-    Color hair  = { 226, 226, 223, 255 };
-    Color gold  = { 218, 180,  62, 255 };
-    Color pupil = {  70,  80, 110, 255 };
-    Color mouth = { 168, 112,  96, 255 };
-    Color shoe  = { 122,  44,  38, 255 };
-
-    rlPushMatrix();
-    rlTranslatef(NPC_POS.x, NPC_POS.y, NPC_POS.z);
-    rlRotatef(90.0f - NPC_YAW * RAD2DEG, 0.0f, 1.0f, 0.0f);
-
-    DrawCube((Vector3){ 0.0f, 0.45f, 0.0f }, 0.52f, 0.90f, 0.30f, robe);
-    DrawCube((Vector3){ -0.12f, 0.04f, 0.12f }, 0.16f, 0.08f, 0.16f, shoe);
-    DrawCube((Vector3){  0.12f, 0.04f, 0.12f }, 0.16f, 0.08f, 0.16f, shoe);
-    DrawCube((Vector3){ 0.0f, 1.10f, 0.0f }, 0.52f, 0.55f, 0.28f, robe);
-    DrawCube((Vector3){ 0.0f, 1.31f, 0.0f }, 0.56f, 0.24f, 0.32f, cape);
-    DrawCube((Vector3){ 0.0f, 1.05f, 0.155f }, 0.05f, 0.20f, 0.02f, gold);
-    DrawCube((Vector3){ 0.0f, 1.10f, 0.155f }, 0.13f, 0.05f, 0.02f, gold);
-
-    rlPushMatrix();
-    rlTranslatef(0.0f, 1.52f, 0.0f);
-    rlRotatef(headYawDeg, 0.0f, 1.0f, 0.0f);
-    rlRotatef(headPitchDeg, 1.0f, 0.0f, 0.0f);
-    DrawCube((Vector3){ 0.0f, 0.25f, 0.0f }, 0.50f, 0.50f, 0.50f, skin);
-    DrawCube((Vector3){ 0.0f, 0.515f, 0.0f }, 0.52f, 0.07f, 0.52f, capC);
-    DrawCube((Vector3){ -0.26f, 0.30f, 0.0f }, 0.03f, 0.20f, 0.42f, hair);
-    DrawCube((Vector3){  0.26f, 0.30f, 0.0f }, 0.03f, 0.20f, 0.42f, hair);
-    DrawCube((Vector3){ -0.10f, 0.30f, 0.252f }, 0.10f, 0.07f, 0.02f, WHITE);
-    DrawCube((Vector3){  0.10f, 0.30f, 0.252f }, 0.10f, 0.07f, 0.02f, WHITE);
-    DrawCube((Vector3){ -0.09f, 0.30f, 0.262f }, 0.05f, 0.07f, 0.02f, pupil);
-    DrawCube((Vector3){  0.11f, 0.30f, 0.262f }, 0.05f, 0.07f, 0.02f, pupil);
-    DrawCube((Vector3){ -0.10f, 0.36f, 0.252f }, 0.12f, 0.03f, 0.02f, hair);
-    DrawCube((Vector3){  0.10f, 0.36f, 0.252f }, 0.12f, 0.03f, 0.02f, hair);
-    DrawCube((Vector3){  0.00f, 0.20f, 0.258f }, 0.08f, 0.09f, 0.03f, skin2);
-    DrawCube((Vector3){  0.00f, 0.10f, 0.252f }, 0.15f, 0.04f, 0.02f, mouth);
-    rlPopMatrix();
-
-    rlPushMatrix();
-    rlTranslatef(-0.37f, 1.38f, 0.0f);
-    rlRotatef(sinf(gNow * 1.3f) * 3.0f, 1.0f, 0.0f, 0.0f);
-    DrawCube((Vector3){ 0.0f, -0.26f, 0.0f }, 0.24f, 0.62f, 0.24f, robe);
-    DrawCube((Vector3){ 0.0f, -0.60f, 0.0f }, 0.15f, 0.12f, 0.15f, skin);
-    rlPopMatrix();
-
-    rlPushMatrix();
-    rlTranslatef(0.37f, 1.38f, 0.0f);
-    rlRotatef(waveDeg, 0.0f, 0.0f, 1.0f);
-    rlRotatef(sinf(gNow * 1.1f) * 3.0f, 1.0f, 0.0f, 0.0f);
-    DrawCube((Vector3){ 0.0f, -0.26f, 0.0f }, 0.24f, 0.62f, 0.24f, robe);
-    DrawCube((Vector3){ 0.0f, -0.60f, 0.0f }, 0.15f, 0.12f, 0.15f, skin);
-    rlPopMatrix();
-
-    rlPopMatrix();
-}
-
-/* ---------------- NPC: Glazew ---------------- */
-
-static void glzInit(int classIdx) {
-    gGlz.home = gClassCtr[classIdx];
-    gGlz.pos = gGlz.home;
-    gGlz.vel = (Vector3){ 0 };
-    gGlz.yaw = -PI / 2.0f;
-    gGlz.hp = 12;
-    gGlz.active = 1;
-    gGlz.state = 0;
-    gGlz.stateT = gGlz.hitCool = gGlz.flashT = gGlz.animT = 0;
-}
-
-static void drawGlazew(void) {
-    if (!gGlz.active) return;
-    float fl = (gGlz.flashT > 0) ? 1.0f : 0.0f;
-    Color skin  = { 235, 195, 165, 255 };
-    Color shirt = { (unsigned char)(95 + 120 * fl), 98, 104, 255 };   /* szary sweter */
-    Color pants = { 40, 42, 48, 255 };
-    Color shoe  = { 70, 50, 35, 255 };
-    Color hair  = { 88, 62, 40, 255 };
-    Color frame = { 25, 25, 28, 255 };
-    Color paper = { 252, 252, 250, 255 };
-
-    float swing = sinf(gGlz.animT) * 40.0f *
-                  ((gGlz.state == 2 || gGlz.state == 3) ? 1.0f : 0.0f);
-
-    rlPushMatrix();
-    rlTranslatef(gGlz.pos.x, gGlz.pos.y, gGlz.pos.z);
-    rlRotatef(90.0f - gGlz.yaw * RAD2DEG, 0.0f, 1.0f, 0.0f);
-
-    DrawCube((Vector3){ 0.0f, 1.125f, 0.0f }, 0.50f, 0.75f, 0.25f, shirt);
-
-    /* glowa: wlosy, okulary, surowa mina */
-    rlPushMatrix();
-    rlTranslatef(0.0f, 1.50f, 0.0f);
-    DrawCube((Vector3){ 0.0f, 0.25f, 0.0f }, 0.50f, 0.50f, 0.50f, skin);
-    DrawCube((Vector3){ 0.0f, 0.47f, -0.02f }, 0.52f, 0.12f, 0.50f, hair);
-    DrawCube((Vector3){ 0.0f, 0.38f, -0.24f }, 0.52f, 0.22f, 0.06f, hair);
-    DrawCube((Vector3){ -0.10f, 0.30f, 0.252f }, 0.13f, 0.10f, 0.02f, frame);   /* okulary */
-    DrawCube((Vector3){  0.10f, 0.30f, 0.252f }, 0.13f, 0.10f, 0.02f, frame);
-    DrawCube((Vector3){  0.00f, 0.31f, 0.252f }, 0.08f, 0.03f, 0.02f, frame);
-    DrawCube((Vector3){ -0.10f, 0.30f, 0.258f }, 0.08f, 0.05f, 0.02f, WHITE);
-    DrawCube((Vector3){  0.10f, 0.30f, 0.258f }, 0.08f, 0.05f, 0.02f, WHITE);
-    DrawCube((Vector3){ -0.09f, 0.30f, 0.262f }, 0.04f, 0.05f, 0.02f, frame);
-    DrawCube((Vector3){  0.11f, 0.30f, 0.262f }, 0.04f, 0.05f, 0.02f, frame);
-    DrawCube((Vector3){  0.00f, 0.18f, 0.258f }, 0.08f, 0.09f, 0.03f, (Color){ 214, 170, 140, 255 });
-    DrawCube((Vector3){  0.00f, 0.08f, 0.252f }, 0.14f, 0.03f, 0.02f, (Color){ 120, 75, 65, 255 });
-    rlPopMatrix();
-
-    /* lewa reka - wymachuje przy bieganiu */
-    rlPushMatrix();
-    rlTranslatef(-0.375f, 1.42f, 0.0f);
-    rlRotatef(-swing, 1.0f, 0.0f, 0.0f);
-    DrawCube((Vector3){ 0.0f, -0.28f, 0.0f }, 0.24f, 0.68f, 0.24f, shirt);
-    DrawCube((Vector3){ 0.0f, -0.62f, 0.0f }, 0.18f, 0.14f, 0.18f, skin);
-    rlPopMatrix();
-
-    /* prawa reka - wyciagnieta do przodu z biala kartka A3 */
-    rlPushMatrix();
-    rlTranslatef(0.375f, 1.42f, 0.0f);
-    rlRotatef(-75.0f + sinf(gGlz.animT * 0.7f) * 5.0f, 1.0f, 0.0f, 0.0f);
-    DrawCube((Vector3){ 0.0f, -0.28f, 0.0f }, 0.24f, 0.68f, 0.24f, shirt);
-    DrawCube((Vector3){ 0.0f, -0.62f, 0.0f }, 0.18f, 0.14f, 0.18f, skin);
-    /* kartka A3 (pion, lekko pochylona) */
-    DrawCube((Vector3){ -0.18f, -0.72f, 0.0f }, 0.02f, 0.60f, 0.42f, paper);
-    rlPopMatrix();
-
-    for (int s = -1; s <= 1; s += 2) {
-        rlPushMatrix();
-        rlTranslatef(s * 0.125f, 0.78f, 0.0f);
-        rlRotatef(s * swing, 1.0f, 0.0f, 0.0f);
-        DrawCube((Vector3){ 0.0f, -0.39f, 0.0f }, 0.24f, 0.78f, 0.24f, pants);
-        DrawCube((Vector3){ 0.0f, -0.70f, 0.01f }, 0.26f, 0.16f, 0.28f, shoe);
-        rlPopMatrix();
-    }
-    rlPopMatrix();
-}
-
-/* ---------------- roboty ---------------- */
-
-static void drawRobots(void) {
-    for (int i = 0; i < gRobotN; i++) {
-        Robot *r = &gRobots[i];
-        float a = gNow * r->sp + r->ph;
-        float x = r->cx + cosf(a) * r->rx;
-        float z = r->cz + sinf(a) * r->rz;
-        float dx = -sinf(a) * r->rx * r->sp;
-        float dz =  cosf(a) * r->rz * r->sp;
-        float yaw = atan2f(dz, dx);
-        float y = GROUND + 1.0f + 0.04f * sinf(gNow * 6.0f + i);
-        Color body = { 150, 158, 170, 255 };
-        Color dark = {  60,  62,  70, 255 };
-        Color led  = { 60, (unsigned char)(150 + 100 * sinf(gNow * 5.0f + i * 2)), 220, 255 };
-
-        rlPushMatrix();
-        rlTranslatef(x, y, z);
-        rlRotatef(90.0f - yaw * RAD2DEG, 0.0f, 1.0f, 0.0f);
-        DrawCube((Vector3){ 0, 0.10f, 0 },  0.40f, 0.12f, 0.50f, dark);       /* podwozie */
-        DrawCube((Vector3){ -0.22f, 0.10f, -0.15f }, 0.08f, 0.16f, 0.16f, dark);
-        DrawCube((Vector3){  0.22f, 0.10f, -0.15f }, 0.08f, 0.16f, 0.16f, dark);
-        DrawCube((Vector3){ -0.22f, 0.10f,  0.15f }, 0.08f, 0.16f, 0.16f, dark);
-        DrawCube((Vector3){  0.22f, 0.10f,  0.15f }, 0.08f, 0.16f, 0.16f, dark);
-        DrawCube((Vector3){ 0, 0.42f, 0 },  0.36f, 0.50f, 0.40f, body);       /* korpus */
-        rlPushMatrix();                                                        /* glowa sie kreci */
-        rlTranslatef(0, 0.78f, 0);
-        rlRotatef(sinf(gNow * 2.0f + i) * 45.0f, 0.0f, 1.0f, 0.0f);
-        DrawCube((Vector3){ 0, 0.10f, 0 },  0.26f, 0.22f, 0.26f, body);
-        DrawCube((Vector3){ -0.06f, 0.10f, 0.135f }, 0.06f, 0.06f, 0.02f, led);
-        DrawCube((Vector3){  0.06f, 0.10f, 0.135f }, 0.06f, 0.06f, 0.02f, led);
-        DrawCube((Vector3){ 0, 0.28f, 0 },  0.03f, 0.14f, 0.03f, dark);       /* antenka */
-        DrawCube((Vector3){ 0, 0.37f, 0 },  0.07f, 0.07f, 0.07f, led);
-        rlPopMatrix();
-        rlPopMatrix();
-    }
-}
-
 /* ---------------- HUD: ikony, serca ---------------- */
 
 static void drawCubeIcon(float x, float y, float s, int b) {
@@ -1412,7 +1277,7 @@ static void netSendNote(const Note *n) {
 }
 
 /* komunikat systemowy: lokalnie + do wszystkich */
-static void sysChat(const char *fmt, ...) {
+void sysChat(const char *fmt, ...) {
     char tmp[150];
     va_list ap;
     va_start(ap, fmt);
@@ -1440,7 +1305,7 @@ static void cmdReply(int sender, const char *fmt, ...) {
 }
 
 /* operacja na innym graczu (host -> klient) albo na sobie */
-static void applyToPlayer(int id, int op, float a, float b, float c) {
+void applyToPlayer(int id, int op, float a, float b, float c) {
     if (id == gMyId) {
         switch (op) {
             case OP_TP:   gPos = (Vector3){ a, b, c }; gVel = (Vector3){ 0 }; gSitting = 0; break;
@@ -1459,112 +1324,6 @@ static void applyToPlayer(int id, int op, float a, float b, float c) {
 
 static int glzAuthority(void) { return netRole() != NET_CLIENT; }
 
-static void glzSwordHit(float dirx, float dirz) {   /* tylko autorytet */
-    if (!gGlz.active) return;
-    gGlz.hp -= 4;
-    gGlz.flashT = 0.25f;
-    gGlz.state = 2;
-    Vector3 np = gGlz.pos;
-    np.x += dirx * 1.4f;
-    np.z += dirz * 1.4f;
-    if (!boxCollidesHW(np, 0.3f, 1.8f)) gGlz.pos = np;
-    gGlz.vel.y = 4.5f;
-    if (gGlz.hp <= 0) {
-        gGlz.active = 0;
-        sysChat("Glazew zostal pokonany! (komenda /glazew przywroci go)");
-    }
-}
-
-static void glzUpdate(float dt) {
-    if (!gGlz.active) return;
-    gGlz.hitCool -= dt;
-    gGlz.flashT -= dt;
-
-    /* najblizszy zywy gracz */
-    int targetId = -1;
-    float best = 1e9f;
-    Vector3 tp = { 0 };
-    if (!gDead) {
-        best = sqrtf((gPos.x - gGlz.pos.x) * (gPos.x - gGlz.pos.x) +
-                     (gPos.z - gGlz.pos.z) * (gPos.z - gGlz.pos.z));
-        targetId = gMyId;
-        tp = gPos;
-    }
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        if (!gPeers[i].active || i == gMyId) continue;
-        float d = sqrtf((gPeers[i].pos.x - gGlz.pos.x) * (gPeers[i].pos.x - gGlz.pos.x) +
-                        (gPeers[i].pos.z - gGlz.pos.z) * (gPeers[i].pos.z - gGlz.pos.z));
-        if (d < best) { best = d; targetId = i; tp = gPeers[i].pos; }
-    }
-
-    Vector3 head = { gGlz.pos.x, gGlz.pos.y + 1.6f, gGlz.pos.z };
-    Vector3 teye = { tp.x, tp.y + EYE_HEIGHT, tp.z };
-    float mvx = 0, mvz = 0;
-
-    switch (gGlz.state) {
-        case 0:   /* czeka w sali z kartka */
-            if (targetId >= 0 && best < 9.0f && lineOfSight(head, teye)) {
-                gGlz.state = 1;
-                gGlz.stateT = 0;
-            }
-            break;
-        case 1:   /* zauwazyl - chwila grozy */
-            gGlz.yaw = atan2f(tp.z - gGlz.pos.z, tp.x - gGlz.pos.x);
-            gGlz.stateT += dt;
-            if (gGlz.stateT > 1.2f) gGlz.state = 2;
-            break;
-        case 2: { /* goni */
-            if (targetId < 0) { gGlz.state = 3; break; }
-            float dx = tp.x - gGlz.pos.x, dz = tp.z - gGlz.pos.z;
-            float l = sqrtf(dx * dx + dz * dz);
-            gGlz.yaw = atan2f(dz, dx);
-            if (l > 0.01f) { mvx = dx / l * 5.0f; mvz = dz / l * 5.0f; }
-            gGlz.animT += 11.0f * dt;
-            if (best < 1.35f && gGlz.hitCool <= 0.0f) {
-                gGlz.hitCool = 1.2f;
-                applyToPlayer(targetId, OP_DMG, 3, 0, 0);
-            }
-            if (best > 45.0f) gGlz.state = 3;
-            break;
-        }
-        case 3: { /* wraca do sali */
-            float dx = gGlz.home.x - gGlz.pos.x, dz = gGlz.home.z - gGlz.pos.z;
-            float l = sqrtf(dx * dx + dz * dz);
-            if (l < 0.8f) { gGlz.state = 0; break; }
-            gGlz.yaw = atan2f(dz, dx);
-            mvx = dx / l * 3.5f;
-            mvz = dz / l * 3.5f;
-            gGlz.animT += 8.0f * dt;
-            if (targetId >= 0 && best < 7.0f && lineOfSight(head, teye)) gGlz.state = 1;
-            break;
-        }
-    }
-
-    /* fizyka z auto-skokiem */
-    gGlz.vel.y -= 24.0f * dt;
-    if (gGlz.vel.y < -28.0f) gGlz.vel.y = -28.0f;
-    Vector3 np = gGlz.pos;
-    int blocked = 0;
-    np.x += mvx * dt;
-    if (boxCollidesHW(np, 0.3f, 1.8f)) { np.x = gGlz.pos.x; blocked = 1; }
-    np.z += mvz * dt;
-    if (boxCollidesHW(np, 0.3f, 1.8f)) { np.z = gGlz.pos.z; blocked = 1; }
-    np.y += gGlz.vel.y * dt;
-    int og = 0;
-    if (boxCollidesHW(np, 0.3f, 1.8f)) {
-        if (gGlz.vel.y < 0.0f) {
-            np.y = floorf(np.y) + 1.0f;
-            if (boxCollidesHW(np, 0.3f, 1.8f)) np.y = gGlz.pos.y;
-            og = 1;
-        } else {
-            np.y = gGlz.pos.y;
-        }
-        gGlz.vel.y = 0;
-    }
-    gGlz.pos = np;
-    if (blocked && og) gGlz.vel.y = 8.0f;
-    if (gGlz.pos.y < -24.0f) { gGlz.pos = gGlz.home; gGlz.vel = (Vector3){ 0 }; gGlz.state = 3; }
-}
 
 /* ---------------- komendy ---------------- */
 
@@ -1635,7 +1394,7 @@ static void runCommand(const char *line, int sender) {
         cmdReply(sender, "Przelaczono latanie: %s", nickOf(who));
     } else if (_stricmp(cmd, "glazew") == 0) {
         if (!glzAuthority()) { cmdReply(sender, "To moze zrobic tylko host"); return; }
-        glzInit(GetRandomValue(0, 3));
+        glzInit(gClassCtr[GetRandomValue(0, 3)]);
         sysChat("Glazew pojawil sie w jednej z sal...");
     } else if (_stricmp(cmd, "host") == 0) {
         if (sender != gMyId) return;
@@ -1747,6 +1506,7 @@ static void processNet(void) {
                         if (inBounds(x, y, z)) {
                             if (world[x][y][z] == B_NOTEBOOK && b == B_AIR) removeNote(x, y, z);
                             world[x][y][z] = (unsigned char)b;
+                            waterOnEdit(x, y, z);
                             gNeedRebuild = 1;
                             netBroadcastExcept(from, gRB, len);
                         }
@@ -1789,6 +1549,7 @@ static void processNet(void) {
                 case M_WORLD:
                     if (len - 1 == (int)sizeof(world)) {
                         memcpy(world, gRB + 1, sizeof(world));
+                        waterInit();          /* odtworz poziomy wody z pobranego swiata */
                         memset(gNotes, 0, sizeof(gNotes));
                         gNeedRebuild = 1;
                         chatPush("[i] Swiat pobrany - milej gry!");
@@ -1813,6 +1574,7 @@ static void processNet(void) {
                         if (inBounds(x, y, z)) {
                             if (world[x][y][z] == B_NOTEBOOK && b == B_AIR) removeNote(x, y, z);
                             world[x][y][z] = (unsigned char)b;
+                            waterOnEdit(x, y, z);
                             gNeedRebuild = 1;
                         }
                     }
@@ -1888,10 +1650,12 @@ int main(void) {
 
     snprintf(gNick, sizeof(gNick), "Gracz%d", GetRandomValue(100, 999));
     genWorld();
+    waterInit();          /* poziomy wody ze stanu swiata (jeziora/fontanna = zrodla) */
     rebuildWorldModels();
     initSounds();
     initJp2Music();
-    glzInit(GetRandomValue(0, 3));
+    glzInit(gClassCtr[GetRandomValue(0, 3)]);
+    catsSpawnDefault();
 
     gSpawn = (Vector3){ 96.5f, (float)(GROUND + 1), 60.5f };
     gPos = gSpawn;
@@ -1919,8 +1683,7 @@ int main(void) {
         gNow = (float)GetTime();
 
         processNet();
-        if (glzAuthority()) glzUpdate(dt);
-        else if (gGlz.state == 2 || gGlz.state == 3) gGlz.animT += 10.0f * dt;
+        entitiesUpdate(dt, glzAuthority());   /* AI Glazewa (jesli autorytet) + koty */
         if (gGlz.state == 1 && prevGlzState == 0) {
             toast("Glazew Cie zauwazyl...");
             SetSoundPitch(sndHit, 0.55f);
@@ -2232,13 +1995,17 @@ int main(void) {
                     } else {
                         if (b == B_NOTEBOOK) removeNote(hit[0], hit[1], hit[2]);
                         world[hit[0]][hit[1]][hit[2]] = B_AIR;
+                        waterOnEdit(hit[0], hit[1], hit[2]);
                         SetSoundPitch(sndBreak, 0.90f + GetRandomValue(0, 20) / 100.0f);
                         PlaySound(sndBreak);
                         netSendBlock(hit[0], hit[1], hit[2], B_AIR);
                         gNeedRebuild = 1;
                     }
                 }
-            } else if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && hasHit) {
+            } else if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+              if (catInteract(eye, fwd, 3.0f, gMyId)) {
+                /* interakcja z kotem (oswajanie / siad) - nie stawiamy bloku */
+              } else if (hasHit) {
                 unsigned char hb = world[hit[0]][hit[1]][hit[2]];
                 if (hb == B_CHAIR) {                              /* siadanie */
                     gSitting = 1;
@@ -2256,6 +2023,7 @@ int main(void) {
                                    bz < gPos.z + PLAYER_HW && bz + 1 > gPos.z - PLAYER_HW);
                     if (!overlap) {
                         world[prev[0]][prev[1]][prev[2]] = (unsigned char)gHotbar[gSel];
+                        waterOnEdit(prev[0], prev[1], prev[2]);
                         SetSoundPitch(sndPlace, 0.90f + GetRandomValue(0, 20) / 100.0f);
                         PlaySound(sndPlace);
                         netSendBlock(prev[0], prev[1], prev[2], gHotbar[gSel]);
@@ -2264,8 +2032,11 @@ int main(void) {
                 } else if (gHotbar[gSel] >= 100) {
                     toast("Trzymasz narzedzie - wybierz blok, aby budowac");
                 }
+              }
             }
         }
+        gWaterAcc += dt;                  /* symulacja rozlewania wody (~5/s) */
+        if (gWaterAcc >= 0.18f) { gWaterAcc = 0.0f; waterTick(); }
         if (gNeedRebuild) { rebuildWorldModels(); gNeedRebuild = 0; }
 
         /* --- siec: wysylka stanu --- */
@@ -2345,6 +2116,7 @@ int main(void) {
                 npcWave * (110.0f + 8.0f * sinf(gNow * 11.0f)));
         drawGlazew();
         drawRobots();
+        drawCats();
         if (gHasTrans) DrawModel(gTrans, (Vector3){ 0 }, 1.0f, WHITE);
         EndMode3D();
 

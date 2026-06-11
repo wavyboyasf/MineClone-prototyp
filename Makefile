@@ -11,7 +11,7 @@
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -std=gnu11 -Wall
-SRC      = main.c net.c
+SRC      = main.c net.c entities.c
 INCLUDE  = -I raylib/include
 
 # --- wykrycie systemu operacyjnego --------------------------------------

@@ -29,6 +29,13 @@ CO JEST W GRZE
   "Dzien dobry!" i macha reka
 - Tryb chodzenia: grawitacja, skakanie, kolizje; plywanie; tryb latania
 - Niszczenie i stawianie blokow
+- Woda rozlewa sie jak w Minecraft: postaw zrodlo wody z ekwipunku (slot
+  "Woda (zrodlo)"), a poplynie w dol i rozleje sie do ~7 kratek; rozkop
+  brzeg jeziora/fontanny, a woda wplynie w wykop; zasyp zrodlo - wyschnie
+- Koty na kampusie: bladzia, mozna je oswoic (PPM kilka razy, az sie uda).
+  Oswojony kot chodzi za Toba; kolejne PPM przelacza siad / chodzenie.
+  Gdy Glazew pierwszy raz Cie uderzy, oswojone koty rzucaja sie na niego.
+- Glazew goni szybciej niz chodzisz, ale wolniej niz sprint - uciekniesz [Shift]
 
 STEROWANIE
 ----------
@@ -41,16 +48,17 @@ F .............. przelacz chodzenie <-> latanie
 F5 ............. zmiana kamery (FPP / TPP zza plecow / TPP z przodu)
 E .............. otworz/zamknij ekwipunek
 LPM ............ zniszcz blok
-PPM ............ postaw blok z wybranego slotu
+PPM ............ postaw blok / oswoj kota / posadz kota (gdy celujesz w kota)
 1-9 ............ wybor slotu paska narzedzi
 Kolko myszy .... przewijanie slotow paska narzedzi
 T .............. przywitaj sie z NPC (gdy stoisz blisko)
 R .............. respawn (po smierci)
 ESC ............ zamknij ekwipunek / uwolnij kursor myszy
 
-Kod sklada sie z dwoch plikow zrodlowych: main.c (gra) oraz net.c
-(siec LAN). net.c jest wieloplatformowy - na Windows uzywa Winsock2,
-na Linux gniazd POSIX - wiec ten sam kod kompiluje sie na obu systemach.
+Kod sklada sie z trzech plikow zrodlowych: main.c (gra i swiat), entities.c
+(postacie: gracz, NPC, Glazew, roboty, koty) oraz net.c (siec LAN). net.c
+jest wieloplatformowy - na Windows uzywa Winsock2, na Linux gniazd POSIX -
+wiec ten sam kod kompiluje sie na obu systemach.
 
 SAMODZIELNA KOMPILACJA (Linux, najprosciej: make)
 -------------------------------------------------
@@ -66,7 +74,7 @@ Jesli wolisz raylib z systemu (sudo apt install libraylib-dev), make wykryje
 go automatycznie przez pkg-config i uzyje wersji systemowej.
 
 Recznie (bez make), uzywajac dolaczonej biblioteki:
-       gcc -O2 -std=gnu11 main.c net.c -o mineclone -I raylib/include \
+       gcc -O2 -std=gnu11 main.c entities.c net.c -o mineclone -I raylib/include \
            -L raylib/lib -l:libraylib.so -lm -lpthread -ldl \
            -Wl,-rpath,'$ORIGIN/raylib/lib'
 
@@ -76,7 +84,7 @@ Wymagane: Visual Studio Build Tools (cl.exe). Biblioteka raylib 5.5
 dla MSVC jest dolaczona w katalogu raylib\ (include + lib).
 W terminalu "x64 Native Tools Command Prompt":
 
-    cl /O2 /MD /std:c11 main.c net.c /Fe:MineClone.exe /I raylib\include ^
+    cl /O2 /MD /std:c11 main.c entities.c net.c /Fe:MineClone.exe /I raylib\include ^
        /link /LIBPATH:raylib\lib raylib.lib opengl32.lib gdi32.lib ^
        winmm.lib ws2_32.lib user32.lib shell32.lib ^
        /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup
@@ -88,7 +96,7 @@ SAMODZIELNA KOMPILACJA (Windows, MSYS2/MinGW)
 2. W katalogu z main.c (mingw32-make uzywa dolaczonego Makefile):
        mingw32-make
    albo recznie:
-       gcc main.c net.c -o MineClone.exe -O2 -lraylib \
+       gcc main.c entities.c net.c -o MineClone.exe -O2 -lraylib \
            -lopengl32 -lgdi32 -lwinmm -lws2_32 -mwindows
 
 Zbudowano w oparciu o raylib 5.5 (https://www.raylib.com, licencja zlib).
