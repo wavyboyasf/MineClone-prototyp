@@ -1620,7 +1620,7 @@ static void runCommand(const char *line, int sender) {
         cmdReply(sender, "Przelaczono latanie: %s", nickOf(who));
     } else if (_stricmp(cmd, "glazew") == 0) {
         if (!glzAuthority()) { cmdReply(sender, "To moze zrobic tylko host"); return; }
-        glzInit(GetRandomValue(0, 3));
+        glzInit(0); /*TEST*/
         sysChat("Glazew pojawil sie w jednej z sal...");
     } else if (_stricmp(cmd, "host") == 0) {
         if (sender != gMyId) return;
@@ -1876,12 +1876,12 @@ int main(void) {
     rebuildWorldModels();
     initSounds();
     initJp2Music();
-    glzInit(GetRandomValue(0, 3));
+    glzInit(0); /*TEST*/
 
-    gSpawn = (Vector3){ 96.5f, (float)(GROUND + 1), 60.5f };
+    gSpawn = (Vector3){ 73.5f, (float)(GROUND + 1), 100.4f }; /*TEST*/
     gPos = gSpawn;
     gVel = (Vector3){ 0 };
-    gYaw = PI / 2.0f;
+    gYaw = -PI / 2.0f; /*TEST*/
     gPitch = 0.06f;
     int captured = 1, camMode = 0, invOpen = 0, chatOpen = 0;
     Note *noteEdit = NULL;
@@ -2632,3 +2632,4 @@ int main(void) {
     CloseWindow();
     return 0;
 }
+
